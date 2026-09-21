@@ -21,7 +21,9 @@ The goal of this project was to eliminate the manual, time-consuming process of 
 *   **Anti-Bot & Security Bypass:** Successfully implemented strategies to bypass Cloudflare's strict bot protection algorithms and navigate Odoo's complex cross-subdomain session management.
 *   **Asynchronous DOM Handling:** Designed robust explicit waits (`WebDriverWait`) to handle Single Page Application (SPA) loading states, ensuring the script perfectly times its actions with asynchronous JavaScript rendering.
 *   **Advanced Element Interaction:** Utilized JavaScript injection (`execute_script`) to force-scroll and interact with DOM elements hidden behind dynamic overlays or custom web components.
-*   **Autonomous Execution & Logging:** The script runs entirely in the background, automatically archives previous backups with precise timestamps to prevent overwriting, and generates detailed execution logs (`log_error.txt`) for system administrators.
+*   **Autonomous Execution & Logging:** The script runs entirely in the background, automatically archives previous backups with precise timestamps to prevent overwriting, and generates detailed execution logs (`log_odoo_{current_date}.txt`) for system administrators.
+*   **Memory & Process Management (DevOps):** Engineered a custom PowerShell garbage collection routine within Python to accurately identify and terminate orphaned Chrome processes based on the user-data directory, ensuring zero memory leaks on the host server.
+*   **Secure Credential Handling:** Implemented strict OS-level environment variable integration for authentication, completely removing hardcoded credentials from the source code.
 
 ---
 
