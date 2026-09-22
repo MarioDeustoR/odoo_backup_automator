@@ -35,3 +35,19 @@ As the sole developer and IT Administrator for this project, my responsibilities
 2.  **Script Development:** Writing, debugging, and optimizing the Python automation script to handle unpredictable web loading times and strict security measures.
 3.  **Security Navigation:** Researching and implementing advanced automation solutions to interact with enterprise-grade web security without being flagged.
 4.  **Deployment & Maintenance:** Setting up the script for scheduled execution on local servers, ensuring robust error handling and memory management to prevent zombie processes.
+
+## ⚙️ Installation & Usage
+
+### Prerequisites
+- Python 3.8 or higher.
+- Google Chrome browser installed.
+
+### Installation
+1. Clone this repository:
+   `git clone https://github.com/tu-usuario/tu-repo-python.git`
+2. Install the required dependencies:
+   `pip install undetected_chromedriver selenium`
+
+### Usage
+Run the script from the terminal:
+`python main.py`
