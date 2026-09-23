@@ -6,11 +6,13 @@ from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import TimeoutException
 import time
 import os
+import re
 import glob
 import sys
 import datetime
 import traceback
 import subprocess
+import winreg
 
 # --- INTERCEPTOR DE CONSOLA Y LOG ---
 class DobleSalida:
@@ -34,10 +36,6 @@ sys.stderr = sys.stdout
 # -------------------------------------------
 
 # 1. Credenciales por variable de entorno (ya NO en texto plano en el script).
-#    Configuralas UNA VEZ en el servidor, como administrador:
-#       setx ODOO_BACKUP_USER "tu_correo" /M
-#       setx ODOO_BACKUP_PASS "tu_contraseña" /M
-#    (se recogen en la SIGUIENTE ejecucion, no en una consola ya abierta)
 CORREO = os.environ.get("ODOO_BACKUP_USER")
 PASSWORD = os.environ.get("ODOO_BACKUP_PASS")
 RUTA_LOCAL = r"S:\CopiaSeg\Odoo"
@@ -55,11 +53,7 @@ if not CORREO or not PASSWORD:
 def limpiar_chrome_residual(filtro_ruta):
     """Busca y mata cualquier chrome.exe que siga vivo usando ESTE perfil en
     concreto (lo identifica por su --user-data-dir en la linea de comandos),
-    sin tocar otras ventanas de Chrome del servidor. Hace falta porque
-    undetected_chromedriver a veces lanza el navegador como un proceso
-    independiente (no como hijo de chromedriver.exe), asi que matar solo el
-    PID de chromedriver con /T no siempre alcanza al navegador real -- que es
-    justo lo que se ha visto quedarse abierto y con la tarea "en ejecucion"."""
+    sin tocar otras ventanas de Chrome del servidor."""
     try:
         ruta_script = os.path.join(os.environ.get("TEMP", RUTA_LOCAL), "limpiar_chrome_odoo.ps1")
         contenido_ps1 = (
@@ -77,9 +71,74 @@ def limpiar_chrome_residual(filtro_ruta):
             capture_output=True, text=True, timeout=30
         )
         n = resultado.stdout.strip() or "0"
-        print(f"    -> Barrido final: {n} proceso(s) chrome.exe residual(es) de este perfil eliminado(s).")
+        print(f"    -> Barrido de Chrome: {n} proceso(s) chrome.exe de este perfil eliminado(s).")
+        return n
     except Exception as e:
-        print(f"    -> No se pudo hacer el barrido final de Chrome: {e}")
+        print(f"    -> No se pudo hacer el barrido de Chrome: {e}")
+        return None
+
+
+def detectar_version_chrome():
+    """Detecta la version MAYOR de Chrome instalada AHORA MISMO en el
+    servidor. Prueba varias estrategias porque las rutas fijas de Program
+    Files no encontraron nada en este servidor (probablemente Chrome esta
+    instalado a nivel de usuario, no de maquina):
+      1. Registro: HKCU/HKLM ...\\Google\\Chrome\\BLBeacon\\version (Chrome
+         mantiene ahi su version actual, sin necesitar saber la ruta del .exe)
+      2. Registro: App Paths\\chrome.exe (da la ruta real al ejecutable,
+         la registra el propio instalador este donde este)
+      3. Rutas habituales, incluida la instalacion por-usuario en
+         %LOCALAPPDATA% (la mas probable si no esta en Program Files)
+    """
+    # Estrategia 1: version directa desde el registro
+    claves_version = [
+        (winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Google\Chrome\BLBeacon"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Google\Chrome\BLBeacon"),
+    ]
+    for hive, subkey in claves_version:
+        try:
+            with winreg.OpenKey(hive, subkey) as clave:
+                version_str, _ = winreg.QueryValueEx(clave, "version")
+                m = re.match(r"(\d+)\.", version_str)
+                if m:
+                    return int(m.group(1))
+        except Exception:
+            pass
+
+    # Estrategia 2: ruta del ejecutable via App Paths
+    rutas_candidatas = []
+    claves_apppaths = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+    ]
+    for hive, subkey in claves_apppaths:
+        try:
+            with winreg.OpenKey(hive, subkey) as clave:
+                ruta, _ = winreg.QueryValueEx(clave, "")
+                if ruta:
+                    rutas_candidatas.append(ruta)
+        except Exception:
+            pass
+
+    # Estrategia 3: rutas habituales, incluida la instalacion por-usuario
+    rutas_candidatas += [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Google\Chrome\Application\chrome.exe"),
+    ]
+
+    for ruta in rutas_candidatas:
+        if ruta and os.path.exists(ruta):
+            try:
+                salida = subprocess.check_output([ruta, "--version"], text=True, timeout=10)
+                m = re.search(r"(\d+)\.", salida)
+                if m:
+                    return int(m.group(1))
+            except Exception:
+                pass
+
+    return None  # si nada funciono, undetected_chromedriver decide solo
 
 
 opciones = uc.ChromeOptions()
@@ -96,22 +155,41 @@ prefs = {
 }
 opciones.add_experimental_option("prefs", prefs)
 
-driver = uc.Chrome(
-    options=opciones,
-    user_data_dir=PERFIL_CHROME
-)
+VERSION_CHROME = detectar_version_chrome()
+if VERSION_CHROME:
+    print(f"[Info] Chrome instalado detectado: versión {VERSION_CHROME}")
+else:
+    print("[Info] No se pudo detectar la versión de Chrome instalada; se deja la autodetección de undetected_chromedriver.")
 
-# Guardamos el PID del proceso chromedriver (Chrome cuelga de el como hijo)
-# para poder limpiarlo de forma selectiva al final, sin tocar otros Chrome
-# que pueda haber abiertos en el servidor.
-try:
-    chromedriver_pid = driver.service.process.pid
-except Exception:
-    chromedriver_pid = None
+# Limpieza PREVENTIVA, antes de intentar arrancar nada: si una ejecucion
+# anterior fallo justo al crear el driver (como el desajuste de version del
+# 23/09), puede quedar un chrome.exe a medias bloqueando el perfil, y Chrome
+# se niega a arrancar con "Lock file can not be created / Aborting now to
+# avoid profile corruption". Limpiamos ANTES de intentarlo, no solo despues.
+print("[Info] Comprobando que no haya procesos de una ejecución anterior...")
+limpiar_chrome_residual(PERFIL_CHROME)
 
+driver = None
+chromedriver_pid = None
 hubo_error = False
 
 try:
+    # uc.Chrome() va DENTRO del try (antes estaba fuera): si fallaba aqui
+    # -- como con el desajuste de version del 23/09 -- el finally nunca se
+    # ejecutaba, y el chrome.exe que UC ya habia lanzado internamente se
+    # quedaba huerfano, bloqueando el perfil en el siguiente intento. Ahora
+    # cualquier fallo aqui pasa por la misma limpieza que todo lo demas.
+    driver = uc.Chrome(
+        options=opciones,
+        user_data_dir=PERFIL_CHROME,
+        version_main=VERSION_CHROME
+    )
+
+    try:
+        chromedriver_pid = driver.service.process.pid
+    except Exception:
+        chromedriver_pid = None
+
     # 0. Proteger backups anteriores (Evitar sobreescritura)
     print("[0/6] Preparando el directorio y protegiendo copias anteriores...")
     for archivo in glob.glob(os.path.join(RUTA_LOCAL, "*.zip")):
@@ -146,8 +224,6 @@ try:
         WebDriverWait(driver, 20).until(lambda d: "/web/login" not in d.current_url)
     except TimeoutException:
         if "/web/login" in driver.current_url:
-            # No es que ya hubiera sesion activa: es un fallo real de login
-            # (contraseña incorrecta, pagina caida, etc.) - no lo silenciamos.
             raise Exception(
                 "No aparecio el formulario de login y seguimos en /web/login: "
                 "fallo real de inicio de sesion, no sesion guardada."
@@ -164,18 +240,35 @@ try:
     driver.execute_script("window.location.assign('https://alarca-group.odoo.com/odoo/my-subscription');")
     time.sleep(8)
 
-    # 3. Entrando al iframe
+    # 3. Entrando al iframe (con DOS reintentos si no aparece)
     try:
         WebDriverWait(driver, 30).until(
             EC.frame_to_be_available_and_switch_to_it((By.CSS_SELECTOR, "iframe[title='Mi suscripción']"))
         )
     except TimeoutException:
-        print("    [!] La interfaz de Odoo no ha cargado. Refrescando la página...")
-        driver.refresh()
-        time.sleep(10)
-        WebDriverWait(driver, 30).until(
-            EC.frame_to_be_available_and_switch_to_it((By.CSS_SELECTOR, "iframe[title='Mi suscripción']"))
-        )
+        intentos_iframe = [
+            ("refrescar la página", lambda: driver.refresh()),
+            ("renavegar desde cero", lambda: driver.execute_script(
+                "window.location.assign('https://alarca-group.odoo.com/odoo/my-subscription');"
+            )),
+        ]
+        exito_iframe = False
+        for nombre_intento, accion in intentos_iframe:
+            print(f"    [!] La interfaz de Odoo no ha cargado. Intentando: {nombre_intento}...")
+            try:
+                accion()
+                time.sleep(10)
+                WebDriverWait(driver, 30).until(
+                    EC.frame_to_be_available_and_switch_to_it((By.CSS_SELECTOR, "iframe[title='Mi suscripción']"))
+                )
+                exito_iframe = True
+                break
+            except TimeoutException:
+                continue
+        if not exito_iframe:
+            raise TimeoutException(
+                "El iframe 'Mi suscripción' no aparecio tras refrescar y renavegar desde cero."
+            )
 
     time.sleep(6)
 
@@ -282,62 +375,58 @@ try:
 
         print("\n=== PROCESO FINALIZADO CON ÉXITO ===")
     else:
-        # No salto ninguna excepcion, pero tampoco se confirmo la descarga:
-        # lo tratamos como fallo para que el codigo de salida lo refleje.
         hubo_error = True
 
 except Exception as e:
     hubo_error = True
     print(f"\n[!] ERROR CRÍTICO: {e}")
-    traceback.print_exc()  # traza completa -> queda en el log, no solo el mensaje corto
+    traceback.print_exc()
 
-    try:
-        ruta_foto = rf"{RUTA_LOCAL}\error_vision_bot.png"
-        driver.save_screenshot(ruta_foto)
-        print(f"    Captura de pantalla guardada en: {ruta_foto}")
-    except:
-        pass
+    if driver is not None:
+        try:
+            ruta_foto = rf"{RUTA_LOCAL}\error_vision_bot.png"
+            driver.save_screenshot(ruta_foto)
+            print(f"    Captura de pantalla guardada en: {ruta_foto}")
+        except:
+            pass
 
-    try:
-        ruta_html = rf"{RUTA_LOCAL}\error_pagina.html"
-        with open(ruta_html, "w", encoding="utf-8") as f:
-            f.write(driver.page_source)
-        print(f"    HTML de la página guardado en: {ruta_html}")
-    except:
-        pass
+        try:
+            ruta_html = rf"{RUTA_LOCAL}\error_pagina.html"
+            with open(ruta_html, "w", encoding="utf-8") as f:
+                f.write(driver.page_source)
+            print(f"    HTML de la página guardado en: {ruta_html}")
+        except:
+            pass
 
-    try:
-        ruta_txt = rf"{RUTA_LOCAL}\error_texto_visible.txt"
-        texto_visible = driver.find_element(By.TAG_NAME, "body").text
-        with open(ruta_txt, "w", encoding="utf-8") as f:
-            f.write(texto_visible)
-        print(f"    Texto visible guardado en: {ruta_txt}")
-    except:
-        pass
+        try:
+            ruta_txt = rf"{RUTA_LOCAL}\error_texto_visible.txt"
+            texto_visible = driver.find_element(By.TAG_NAME, "body").text
+            with open(ruta_txt, "w", encoding="utf-8") as f:
+                f.write(texto_visible)
+            print(f"    Texto visible guardado en: {ruta_txt}")
+        except:
+            pass
+    else:
+        print("    (el driver nunca llego a crearse, no hay pagina que capturar)")
 
 finally:
     print("\n[Mantenimiento] Cerrando el navegador y liberando memoria...")
 
-    try:
-        driver.quit()
-    except:
-        pass
+    if driver is not None:
+        try:
+            driver.quit()
+        except:
+            pass
 
-    # Cierre selectivo: solo el proceso que lanzamos nosotros (y sus hijos),
-    # NO todo chrome.exe del servidor.
     try:
         if chromedriver_pid:
             os.system(f"taskkill /F /T /PID {chromedriver_pid} >nul 2>&1")
             print(f"    -> Proceso Chrome (PID {chromedriver_pid}) eliminado.")
-        else:
-            print("    -> No se pudo determinar el PID; se omite la limpieza forzada por PID.")
     except:
         pass
 
-    # Barrido adicional POR PERFIL (no por PID): undetected_chromedriver a
-    # veces lanza Chrome desligado de chromedriver.exe, y entonces el
-    # taskkill de arriba no llega al navegador real -- que es justo lo que
-    # se ha visto quedar abierto con la tarea marcada como "en ejecucion".
+    # Esto se ejecuta SIEMPRE, incluso si uc.Chrome() nunca llego a crear
+    # 'driver' -- es la red que faltaba para el caso del 23/09.
     limpiar_chrome_residual(PERFIL_CHROME)
 
     print("    -> Finalizando proceso de Python...")
